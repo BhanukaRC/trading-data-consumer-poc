@@ -7,8 +7,12 @@ import { setKafkaConsumer, initPartitionTracking, commitOffsetsInOrder,
   checkOffsetIsCompleted, checkOffsetIsInFlight, addOffsetToInFlight,
   removeOffsetFromInFlight, 
   addOffsetToCompleted} from './offset-handler.js';
-import { addReconciliationTimestamp, processPendingReconciliations, getReconciliationTimestamps } from './reconciliation-handler.js';
+import { addReconciliationTimestamp, processPendingReconciliations } from './reconciliation-handler.js';
 import { setReconciliationConsumer, initReconciliationPartitionTracking } from './reconciliation-offset-handler.js';
+import { closeDlqProducer } from './dlq-producer.js';
+import { skipMarketOffsetWithDlq, skipReconciliationOffsetWithDlq } from './dlq-handler.js';
+
+const VALUE_PREVIEW_MAX = 4096;
 
 const kafka = new Kafka({
   clientId: 'calculation-service',
@@ -82,6 +86,7 @@ process.on('SIGINT', async () => {
 async function shutdown(): Promise<void> {
   try {
     await Promise.all([consumer.disconnect(), reconciliationConsumer.disconnect()]);
+    await closeDlqProducer();
     closeGrpcClient();
     await closeDatabase();
     console.log('Shutdown complete');
@@ -116,40 +121,53 @@ async function runConsumer(): Promise<void> {
 
       // Start consumer - it should run indefinitely
       await consumer.run({
-        autoCommit: false, // Manual commit after successful processing
-        eachMessage: async ({ topic, partition, message }) => {
+        autoCommit: false, // Manual commit after successful processing (or after DLQ skip)
+        eachMessage: async ({ partition, message }) => {
+          const currentOffset = message.offset;
+
           if (!message.value) {
-            console.warn(`[MARKET] [DLQ] Received message with no value at partition ${partition}, offset ${message.offset}`);
+            console.warn(
+              `[MARKET] [DLQ] Received message with no value at partition ${partition}, offset ${currentOffset}`
+            );
+            await skipMarketOffsetWithDlq(partition, currentOffset, 'EMPTY_VALUE');
             return;
           }
 
+          const raw: string = message.value.toString();
+          const preview: string = raw.length > VALUE_PREVIEW_MAX ? raw.slice(0, VALUE_PREVIEW_MAX) : raw;
+
+          let parsedMessage: RawMarketMessage;
           try {
-            const parsedMessage: RawMarketMessage = JSON.parse(
-              message.value.toString()
+            parsedMessage = JSON.parse(raw) as RawMarketMessage;
+          } catch (parseError) {
+            const msg = parseError instanceof Error ? parseError.message : String(parseError);
+            console.warn(
+              `[MARKET] [DLQ] JSON parse error at partition ${partition}, offset ${currentOffset}: ${msg}`
             );
-            
-            if (!isParsedRawMarketMessage(parsedMessage)) {
-              console.warn(`[MARKET] [DLQ] Received invalid market message at partition ${partition}, offset ${message.offset}`);
-              return;
-            }
+            await skipMarketOffsetWithDlq(partition, currentOffset, 'JSON_PARSE_ERROR', msg, preview);
+            return;
+          }
 
-            initPartitionTracking(partition);
-              
-            const currentOffset = message.offset;
-              
-            // Check if this offset is already being processed
-            if (checkOffsetIsInFlight(partition, currentOffset) || checkOffsetIsCompleted(partition, currentOffset)) {
-              return;
-            }
+          if (!isParsedRawMarketMessage(parsedMessage)) {
+            console.warn(
+              `[MARKET] [DLQ] Invalid market message at partition ${partition}, offset ${currentOffset}`
+            );
+            await skipMarketOffsetWithDlq(partition, currentOffset, 'INVALID_MARKET_MESSAGE', undefined, preview);
+            return;
+          }
 
-            // Add to in-flight
-            addOffsetToInFlight(partition, currentOffset);
+          initPartitionTracking(partition);
 
-            processMarketMessage(
-              parsedMessage,
-              partition,
-              currentOffset
-            ).then((skipped) => {
+          // Check if this offset is already being processed
+          if (checkOffsetIsInFlight(partition, currentOffset) || checkOffsetIsCompleted(partition, currentOffset)) {
+            return;
+          }
+
+          // Add to in-flight
+          addOffsetToInFlight(partition, currentOffset);
+
+          processMarketMessage(parsedMessage, partition, currentOffset)
+            .then(() => {
               removeOffsetFromInFlight(partition, currentOffset);
               addOffsetToCompleted(partition, currentOffset);
 
@@ -157,49 +175,62 @@ async function runConsumer(): Promise<void> {
               commitOffsetsInOrder(partition).catch((error) => {
                 console.error(`[MARKET] Error committing offsets for partition ${partition}:`, error);
               });
-            }).catch((error) => {
+            })
+            .catch((error) => {
               removeOffsetFromInFlight(partition, currentOffset);
               console.error(
                 `[MARKET] Error processing market message at partition ${partition}, offset ${currentOffset}:`,
                 error
               );
-              throw error;
+              const msg = error instanceof Error ? error.message : String(error);
+              return skipMarketOffsetWithDlq(partition, currentOffset, 'PROCESSING_ERROR', msg, preview);
             });
-          } catch (error) {
-            console.error(
-              `[MARKET] [DLQ] Error processing market message at partition ${partition}, offset ${message.offset}:`,
-              error
-            );
-          }
         },
       });
 
       // Start reconciliation consumer
       await reconciliationConsumer.run({
         autoCommit: false,
-        eachMessage: async ({ topic, partition, message }) => {
+        eachMessage: async ({ partition, message }) => {
+          const currentOffset = message.offset;
+
           if (!message.value) {
-            console.warn(`[RECONCILIATION] Received message with no value at partition ${partition}, offset ${message.offset}`);
+            console.warn(
+              `[RECONCILIATION] Received message with no value at partition ${partition}, offset ${currentOffset}`
+            );
+            await skipReconciliationOffsetWithDlq(partition, currentOffset, 'EMPTY_VALUE');
             return;
           }
 
+          const raw: string = message.value.toString();
+          const preview: string = raw.length > VALUE_PREVIEW_MAX ? raw.slice(0, VALUE_PREVIEW_MAX) : raw;
+
           try {
-            const parsedMessage: ReconciliationMessage = JSON.parse(
-              message.value.toString()
-            );
+            const parsedMessage: ReconciliationMessage = JSON.parse(raw) as ReconciliationMessage;
 
             if (!isParsedReconciliationMessage(parsedMessage)) {
-              console.warn(`[RECONCILIATION] Received invalid reconciliation message at partition ${partition}, offset ${message.offset} - would send to DLQ`);
+              console.warn(
+                `[RECONCILIATION] Invalid reconciliation message at partition ${partition}, offset ${currentOffset}`
+              );
+              await skipReconciliationOffsetWithDlq(
+                partition,
+                currentOffset,
+                'INVALID_RECONCILIATION_MESSAGE',
+                undefined,
+                preview
+              );
               return;
             }
 
             initReconciliationPartitionTracking(partition);
-            addReconciliationTimestamp(parsedMessage.tradeTime, partition, message.offset);
+            addReconciliationTimestamp(parsedMessage.tradeTime, partition, currentOffset);
           } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
             console.error(
-              `[RECONCILIATION] Error processing reconciliation message at partition ${partition}, offset ${message.offset}:`,
+              `[RECONCILIATION] Error processing reconciliation message at partition ${partition}, offset ${currentOffset}:`,
               error
             );
+            await skipReconciliationOffsetWithDlq(partition, currentOffset, 'JSON_PARSE_ERROR', msg, preview);
           }
         },
       });

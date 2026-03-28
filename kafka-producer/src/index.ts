@@ -2,6 +2,7 @@ import { Kafka } from 'kafkajs';
 import { StreamProcessor } from './StreamProcessor';
 import { RawMarketMessage, RawTradeMessage } from './types';
 import { createStreamGenerator, StreamConfig } from './stream-generator';
+import { startDlqTestProducer, stopDlqTestProducer, type DlqTestConfig } from './dlq-test-producer';
 import { Readable } from 'stream';
 import { ReadableStream } from 'stream/web';
 
@@ -14,11 +15,17 @@ const streamConfig: StreamConfig = {
     outOfOrderProbability: parseFloat(process.env.OUT_OF_ORDER_PROBABILITY || '0.05')
 };
 
+const dlqTestConfig: DlqTestConfig = {
+    enabled: process.env.DLQ_TEST_ENABLED === 'true',
+    intervalMs: parseInt(process.env.DLQ_TEST_INTERVAL_MS || '10000', 10),
+};
+
 console.log('Stream Configuration:', {
     tradesPerSecond: streamConfig.tradesPerSecond,
     tradesPerMarketMessage: streamConfig.tradesPerMarketMessage,
     outOfOrderProbability: streamConfig.outOfOrderProbability,
 });
+console.log('DLQ test producer:', dlqTestConfig);
 
 const kafka = new Kafka({
     clientId: 'kafka-producer',
@@ -36,6 +43,7 @@ const producer = kafka.producer();
 process.on('SIGTERM', async () => {
     console.log('Received SIGTERM, shutting down gracefully...');
     try {
+        stopDlqTestProducer();
         await producer.disconnect();
         console.log('Producer disconnected');
         process.exit(0);
@@ -48,6 +56,7 @@ process.on('SIGTERM', async () => {
 process.on('SIGINT', async () => {
     console.log('Received SIGINT, shutting down gracefully...');
     try {
+        stopDlqTestProducer();
         await producer.disconnect();
         console.log('Producer disconnected');
         process.exit(0);
@@ -119,6 +128,8 @@ async function main() {
             await producer.connect();
             console.log('Kafka Producer is ready');
 
+            startDlqTestProducer(producer, dlqTestConfig);
+
             await generateStreamAndProduce();
             console.log('Stream processing completed');
             break;
@@ -126,6 +137,7 @@ async function main() {
             attempt++;
             console.error(`Error connecting to Kafka (attempt ${attempt}/${maxRetries}):`, error);
 
+            stopDlqTestProducer();
             // Disconnect producer before retrying
             try {
                 await producer.disconnect();
